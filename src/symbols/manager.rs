@@ -204,15 +204,109 @@ impl SymbolManager {
             SymbolError::new("Failed to lock resolver")
         })?;
 
-        // 获取模块路径
+        // 获取模块路径 - 优先使用完整路径
         let module_path = module
             .path
             .as_ref()
+            .filter(|p| !p.is_empty() && *p != "<unknown>")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(&module.name));
+            .unwrap_or_else(|| {
+                warn!("Module path not available for {}, using name as fallback", module.name);
+                PathBuf::from(&module.name)
+            });
+
+        // 验证路径是否存在
+        let path_exists = module_path.exists();
+        if !path_exists && module_path != PathBuf::from(&module.name) {
+            warn!("Module path does not exist: {}", module_path.display());
+        }
+
+        info!("[MODULE_LOAD] Processing module load: {} at 0x{:016X} (size: {}, path: {}, exists: {})",
+            module.name, module.base_address, module.size, module_path.display(), path_exists);
+
+        // 诊断：检查模块路径是否有效
+        if !path_exists {
+            error!("[MODULE_LOAD] Module file does not exist: {}", module_path.display());
+            error!("[MODULE_LOAD] Symbol resolution will fail for this module!");
+        }
+
+        // 诊断：检查 PDB 文件是否存在（多种位置）
+        let pdb_path = module_path.with_extension("pdb");
+        let pdb_in_exe_dir = module_path.parent()
+            .map(|p| p.join(format!("{}.pdb", module.name)))
+            .map(|p| p.exists())
+            .unwrap_or(false);
+        
+        // 检查更多可能的 PDB 位置
+        let mut pdb_locations = vec![pdb_path.clone()];
+        if let Some(parent) = module_path.parent() {
+            pdb_locations.push(parent.join(format!("{}.pdb", module.name)));
+            // 也检查 target/debug 目录
+            if let Some(grandparent) = parent.parent() {
+                pdb_locations.push(grandparent.join("debug").join(format!("{}.pdb", module.name)));
+            }
+        }
+        
+        let pdb_exists = pdb_locations.iter().any(|p| p.exists());
+        let existing_pdb_path = pdb_locations.iter().find(|p| p.exists());
+        
+        debug!(
+            "PDB file check for {}: exists={}, locations_checked={}",
+            module.name, pdb_exists, pdb_locations.len()
+        );
+        
+        if let Some(p) = existing_pdb_path {
+            debug!("Found PDB at: {}", p.display());
+        }
+
+        if !path_exists {
+            warn!(
+                "Module file does not exist at '{}'. Symbol resolution will likely fail. Ensure the executable/DLL path is correct and accessible.",
+                module_path.display()
+            );
+        } else if !pdb_exists && !pdb_in_exe_dir {
+            warn!(
+                "PDB file not found for module '{}'. Looked at: {:?} and in executable directory. Symbol resolution will return addresses instead of function names. Build with debug symbols enabled (e.g., 'cargo build') to generate PDB files.",
+                module.name, pdb_path
+            );
+        }
+        
+        // 尝试从模块文件中提取 PDB 信息（CodeView）
+        if path_exists {
+            use crate::symbols::PdbLocator;
+            let locator = PdbLocator::new();
+            match locator.extract_pdb_info(&module_path) {
+                Ok(Some(pdb_info)) => {
+                    info!("Extracted PDB info from module {}: path={}, signature={:?}",
+                          module.name, pdb_info.pdb_path, pdb_info.signature);
+                }
+                Ok(None) => {
+                    debug!("No embedded PDB info found in module {}", module.name);
+                }
+                Err(e) => {
+                    trace!("Failed to extract PDB info from {}: {}", module.name, e);
+                }
+            }
+        }
 
         // 加载模块符号
-        resolver.load_module(&module_path, module.base_address, module.size as u32)?;
+        match resolver.load_module(&module_path, module.base_address, module.size as u32) {
+            Ok(_) => {
+                debug!("Successfully loaded symbols for module: {}", module.name);
+            }
+            Err(e) => {
+                error!("Failed to load symbols for module {} at 0x{:016X}: {}",
+                    module.name, module.base_address, e);
+                // 尝试使用仅文件名再次加载
+                let name_only = PathBuf::from(&module.name);
+                if name_only != module_path {
+                    debug!("Retrying with module name only: {}", module.name);
+                    if let Err(e2) = resolver.load_module(&name_only, module.base_address, module.size as u32) {
+                        trace!("Retry also failed: {}", e2);
+                    }
+                }
+            }
+        }
 
         // 通知回调
         if let Some(callback) = &self.progress_callback {
@@ -271,7 +365,7 @@ impl SymbolManager {
         process_id: ProcessId,
         instruction_pointer: Address,
     ) -> Result<Option<SymbolInfo>> {
-        trace!("Resolving sample at 0x{:016X} for process {}", instruction_pointer, process_id);
+        info!("[SAMPLE_RESOLVE] Resolving sample at 0x{:016X} for process {}", instruction_pointer, process_id);
 
         // 获取解析器
         let resolver = {
@@ -280,9 +374,13 @@ impl SymbolManager {
             })?;
 
             match resolvers.get(&process_id) {
-                Some(r) => Arc::clone(r),
+                Some(r) => {
+                    info!("[SAMPLE_RESOLVE] Found existing resolver for process {}", process_id);
+                    Arc::clone(r)
+                }
                 None => {
                     // 自动创建解析器
+                    warn!("[SAMPLE_RESOLVE] No resolver found for process {}, creating new one", process_id);
                     drop(resolvers);
                     self.create_resolver(process_id)?
                 }
@@ -293,10 +391,32 @@ impl SymbolManager {
             SymbolError::new("Failed to lock resolver")
         })?;
 
-        match resolver.resolve_address(instruction_pointer) {
-            Ok(symbol) => Ok(Some(symbol)),
+        // 检查该进程已加载的模块数
+        match resolver.get_loaded_modules() {
+            Ok(modules) => {
+                info!("[SAMPLE_RESOLVE] Process {} has {} loaded modules", process_id, modules.len());
+                if modules.is_empty() {
+                    warn!("[SAMPLE_RESOLVE] No modules loaded for process {}! Symbol resolution will fail.", process_id);
+                }
+            }
             Err(e) => {
-                trace!("Failed to resolve address: {}", e);
+                warn!("[SAMPLE_RESOLVE] Could not get loaded modules for process {}: {}", process_id, e);
+            }
+        }
+
+        match resolver.resolve_address(instruction_pointer) {
+            Ok(symbol) => {
+                // 检查解析结果是否是地址格式（表示解析失败）
+                if symbol.name.starts_with("0x") {
+                    warn!("[SAMPLE_RESOLVE] Address 0x{:016X} resolved to '{}' (raw address - symbol not found)", 
+                        instruction_pointer, symbol.name);
+                } else {
+                    info!("[SAMPLE_RESOLVE] Address 0x{:016X} resolved to '{}'", instruction_pointer, symbol.name);
+                }
+                Ok(Some(symbol))
+            }
+            Err(e) => {
+                error!("[SAMPLE_RESOLVE] Failed to resolve address 0x{:016X}: {}", instruction_pointer, e);
                 Ok(None)
             }
         }

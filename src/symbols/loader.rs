@@ -10,6 +10,37 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, trace, warn};
 
+/// PE 节表信息
+#[derive(Debug, Clone)]
+struct SectionInfo {
+    /// 虚拟地址
+    virtual_address: u32,
+    /// 虚拟大小
+    virtual_size: u32,
+    /// 文件偏移
+    pointer_to_raw_data: u32,
+    /// 原始数据大小
+    size_of_raw_data: u32,
+}
+
+/// 将 RVA（相对虚拟地址）转换为文件偏移
+fn rva_to_file_offset(rva: u32, sections: &[SectionInfo]) -> u32 {
+    for section in sections {
+        // 检查 RVA 是否在此节的范围内
+        if rva >= section.virtual_address &&
+           rva < section.virtual_address + section.virtual_size {
+            // 计算偏移量
+            let offset_in_section = rva - section.virtual_address;
+            // 确保不超过原始数据大小
+            if offset_in_section < section.size_of_raw_data {
+                return section.pointer_to_raw_data + offset_in_section;
+            }
+        }
+    }
+    // 如果没有匹配的节，可能是 RVA 已经在文件偏移范围内
+    rva
+}
+
 /// PDB 定位器
 ///
 /// 负责查找和定位 PDB 符号文件。
@@ -185,6 +216,9 @@ impl PdbLocator {
                     return Ok(Some(local_path));
                 }
             }
+        } else {
+            trace!("Could not extract PDB info from executable: {}", executable_path.display());
+            trace!("extract_pdb_info is not fully implemented - see loader.rs line 342");
         }
 
         // 2. 尝试在可执行文件所在目录查找同名 PDB
@@ -339,10 +373,16 @@ impl PdbLocator {
     // 内部辅助方法
 
     /// 从可执行文件提取 PDB 信息
-    fn extract_pdb_info(&self, executable_path: &Path) -> Result<Option<EmbeddedPdbInfo>> {
-        // 读取 PE 文件的调试目录
-        // 这是一个简化的实现，实际应该使用 goblin 或其他 PE 解析库
-
+    ///
+    /// 解析 PE 文件的 Debug Directory，读取 CodeView 信息（NB10 或 RSDS 格式），
+    /// 提取 PDB 路径和签名信息。
+    ///
+    /// # 参数
+    /// - `executable_path`: 可执行文件（PE）的路径
+    ///
+    /// # 返回
+    /// 包含 PDB 路径和签名的信息，如果 PE 文件不包含 CodeView 信息则返回 None
+    pub fn extract_pdb_info(&self, executable_path: &Path) -> Result<Option<EmbeddedPdbInfo>> {
         use std::io::{Read, Seek, SeekFrom};
 
         let mut file = match fs::File::open(executable_path) {
@@ -356,6 +396,12 @@ impl PdbLocator {
         // 读取 DOS 头
         let mut dos_header = [0u8; 64];
         if file.read_exact(&mut dos_header).is_err() {
+            return Ok(None);
+        }
+
+        // 验证 DOS 签名
+        if dos_header[0] != 0x4D || dos_header[1] != 0x5A {
+            trace!("Invalid DOS signature");
             return Ok(None);
         }
 
@@ -373,8 +419,18 @@ impl PdbLocator {
             return Ok(None);
         }
 
-        // 跳过 COFF 头 (20 bytes)
-        if file.seek(SeekFrom::Current(20)).is_err() {
+        // 读取 COFF 头
+        let mut coff_header = [0u8; 20];
+        if file.read_exact(&mut coff_header).is_err() {
+            return Ok(None);
+        }
+
+        // 提取 COFF 头信息
+        let number_of_sections = u16::from_le_bytes([coff_header[2], coff_header[3]]);
+        let size_of_optional_header = u16::from_le_bytes([coff_header[16], coff_header[17]]);
+
+        if size_of_optional_header == 0 {
+            trace!("No optional header in PE file");
             return Ok(None);
         }
 
@@ -384,43 +440,259 @@ impl PdbLocator {
             return Ok(None);
         }
 
-        // 回退 2 bytes 到可选头开始
-        let _ = file.seek(SeekFrom::Current(-2));
-
         let is_pe32_plus = u16::from_le_bytes(magic) == 0x20b;
 
-        // 跳转到数据目录（第 7 个是调试目录）
-        // PE32 可选头大小: 224 bytes, PE32+: 240 bytes
-        let data_dir_offset = if is_pe32_plus { 240 - 2 } else { 224 - 2 };
-        if file.seek(SeekFrom::Current(data_dir_offset as i64)).is_err() {
+        trace!("PE file type: {}", if is_pe32_plus { "PE32+" } else { "PE32" });
+
+        // 回到可选头开始位置（PE 签名后 4 bytes + COFF 头 20 bytes = 24 bytes from PE start）
+        if file.seek(SeekFrom::Start(pe_offset + 24)).is_err() {
             return Ok(None);
         }
 
-        // 读取调试目录 RVA 和大小
-        let mut debug_dir_info = [0u8; 8];
-        if file.read_exact(&mut debug_dir_info).is_err() {
+        // 读取完整的可选头
+        let optional_header_size = if is_pe32_plus { 240 } else { 224 };
+        let mut optional_header = vec![0u8; optional_header_size];
+        if file.read_exact(&mut optional_header).is_err() {
             return Ok(None);
         }
 
-        let _debug_rva = u32::from_le_bytes([
-            debug_dir_info[0],
-            debug_dir_info[1],
-            debug_dir_info[2],
-            debug_dir_info[3],
+        // 数据目录在可选头的最后 128 bytes (16 entries * 8 bytes each)
+        // PE32: 数据目录从 offset 96 开始
+        // PE32+: 数据目录从 offset 112 开始
+        let data_dir_offset = if is_pe32_plus { 112 } else { 96 };
+
+        // 调试目录是第7个条目 (索引 6)，每个条目 8 bytes
+        let debug_dir_entry_offset = data_dir_offset + (6 * 8);
+
+        let debug_rva = u32::from_le_bytes([
+            optional_header[debug_dir_entry_offset],
+            optional_header[debug_dir_entry_offset + 1],
+            optional_header[debug_dir_entry_offset + 2],
+            optional_header[debug_dir_entry_offset + 3],
         ]);
-        let _debug_size = u32::from_le_bytes([
-            debug_dir_info[4],
-            debug_dir_info[5],
-            debug_dir_info[6],
-            debug_dir_info[7],
+        let debug_size = u32::from_le_bytes([
+            optional_header[debug_dir_entry_offset + 4],
+            optional_header[debug_dir_entry_offset + 5],
+            optional_header[debug_dir_entry_offset + 6],
+            optional_header[debug_dir_entry_offset + 7],
         ]);
 
-        // 注意：这里简化处理，实际需要解析节表来转换 RVA 到文件偏移
-        // 并读取 DEBUG_DIRECTORY 结构来获取 CodeView 信息
+        if debug_rva == 0 || debug_size == 0 {
+            trace!("No debug directory in PE file");
+            return Ok(None);
+        }
 
-        // 目前返回 None，完整实现需要引入 PE 解析库
-        trace!("PE debug directory parsing not fully implemented");
+        trace!("Debug directory RVA: 0x{:08X}, Size: {}", debug_rva, debug_size);
+
+        // 读取节表以转换 RVA 到文件偏移
+        // 节表在可选头之后
+        if file.seek(SeekFrom::Start(pe_offset + 24 + optional_header_size as u64)).is_err() {
+            return Ok(None);
+        }
+
+        // 现在读取节表
+        let mut sections = Vec::new();
+        for i in 0..number_of_sections {
+            let mut section_header = [0u8; 40];
+            if file.read_exact(&mut section_header).is_err() {
+                break;
+            }
+
+            let virtual_address = u32::from_le_bytes([
+                section_header[12], section_header[13],
+                section_header[14], section_header[15],
+            ]);
+            let virtual_size = u32::from_le_bytes([
+                section_header[8], section_header[9],
+                section_header[10], section_header[11],
+            ]);
+            let pointer_to_raw_data = u32::from_le_bytes([
+                section_header[20], section_header[21],
+                section_header[22], section_header[23],
+            ]);
+            let size_of_raw_data = u32::from_le_bytes([
+                section_header[16], section_header[17],
+                section_header[18], section_header[19],
+            ]);
+
+            sections.push(SectionInfo {
+                virtual_address,
+                virtual_size,
+                pointer_to_raw_data,
+                size_of_raw_data,
+            });
+
+            trace!("Section {}: VA=0x{:08X}, Size=0x{:08X}, Raw=0x{:08X}",
+                   i, virtual_address, virtual_size, pointer_to_raw_data);
+        }
+
+        // 将 RVA 转换为文件偏移
+        let debug_file_offset = rva_to_file_offset(debug_rva, &sections);
+        if debug_file_offset == 0 {
+            trace!("Failed to convert debug directory RVA to file offset");
+            return Ok(None);
+        }
+
+        // 读取调试目录条目
+        if file.seek(SeekFrom::Start(debug_file_offset as u64)).is_err() {
+            return Ok(None);
+        }
+
+        // 计算调试目录条目数量
+        let debug_entry_count = debug_size / 28; // DEBUG_DIRECTORY 结构大小为 28 bytes
+        trace!("Debug directory entries: {}", debug_entry_count);
+
+        for i in 0..debug_entry_count {
+            let mut debug_entry = [0u8; 28];
+            if file.read_exact(&mut debug_entry).is_err() {
+                break;
+            }
+
+            let characteristics = u32::from_le_bytes([debug_entry[0], debug_entry[1], debug_entry[2], debug_entry[3]]);
+            let time_date_stamp = u32::from_le_bytes([debug_entry[4], debug_entry[5], debug_entry[6], debug_entry[7]]);
+            let major_version = u16::from_le_bytes([debug_entry[8], debug_entry[9]]);
+            let minor_version = u16::from_le_bytes([debug_entry[10], debug_entry[11]]);
+            let debug_type = u32::from_le_bytes([debug_entry[12], debug_entry[13], debug_entry[14], debug_entry[15]]);
+            let size_of_data = u32::from_le_bytes([debug_entry[16], debug_entry[17], debug_entry[18], debug_entry[19]]);
+            let address_of_raw_data = u32::from_le_bytes([debug_entry[20], debug_entry[21], debug_entry[22], debug_entry[23]]);
+            let pointer_to_raw_data = u32::from_le_bytes([debug_entry[24], debug_entry[25], debug_entry[26], debug_entry[27]]);
+
+            trace!("Debug entry {}: Type={}, Size={}", i, debug_type, size_of_data);
+
+            // 2 = IMAGE_DEBUG_TYPE_CODEVIEW
+            if debug_type == 2 && size_of_data > 0 && pointer_to_raw_data > 0 {
+                // 读取 CodeView 信息
+                if let Some(pdb_info) = self.read_codeview_info(&mut file, pointer_to_raw_data, size_of_data) {
+                    trace!("Found CodeView info: PDB path = {}", pdb_info.pdb_path);
+                    return Ok(Some(pdb_info));
+                }
+            }
+        }
+
+        trace!("No CodeView debug info found in PE file");
         Ok(None)
+    }
+
+    /// 读取 CodeView 信息
+    ///
+    /// 支持 NB10 和 RSDS 格式
+    fn read_codeview_info(&self, file: &mut fs::File, offset: u32, size: u32) -> Option<EmbeddedPdbInfo> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        if file.seek(SeekFrom::Start(offset as u64)).is_err() {
+            return None;
+        }
+
+        // 读取 CodeView 签名（4 bytes）
+        let mut signature = [0u8; 4];
+        if file.read_exact(&mut signature).is_err() {
+            return None;
+        }
+
+        trace!("CodeView signature: {:?}", String::from_utf8_lossy(&signature));
+
+        // 重置位置
+        if file.seek(SeekFrom::Start(offset as u64)).is_err() {
+            return None;
+        }
+
+        // RSDS 格式（较新的 PDB 7.0 格式）
+        if &signature == b"RSDS" {
+            // RSDS 格式结构：
+            // 4 bytes: "RSDS" 签名
+            // 16 bytes: GUID
+            // 4 bytes: Age
+            // n bytes: PDB 路径（以 null 结尾的 ASCII 字符串）
+
+            let mut rsds_data = vec![0u8; size as usize];
+            if file.read_exact(&mut rsds_data).is_err() {
+                return None;
+            }
+
+            // 提取 GUID（16 bytes）
+            let guid_bytes = &rsds_data[4..20];
+            let guid = format!(
+                "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+                guid_bytes[0], guid_bytes[1], guid_bytes[2], guid_bytes[3],
+                guid_bytes[4], guid_bytes[5], guid_bytes[6], guid_bytes[7],
+                guid_bytes[8], guid_bytes[9], guid_bytes[10], guid_bytes[11],
+                guid_bytes[12], guid_bytes[13], guid_bytes[14], guid_bytes[15]
+            );
+
+            // 提取 Age（4 bytes，little-endian）
+            let age = u32::from_le_bytes([
+                rsds_data[20], rsds_data[21], rsds_data[22], rsds_data[23]
+            ]);
+
+            // 提取 PDB 路径（从第 24 byte 开始，以 null 结尾）
+            let pdb_path_start = 24;
+            let pdb_path_bytes = &rsds_data[pdb_path_start..];
+            let pdb_path = match pdb_path_bytes.iter().position(|&b| b == 0) {
+                Some(null_pos) => String::from_utf8_lossy(&pdb_path_bytes[..null_pos]).to_string(),
+                None => String::from_utf8_lossy(pdb_path_bytes).to_string(),
+            };
+
+            let raw = format!("{}/{}", guid, age);
+            trace!("RSDS format: GUID={}, Age={}, PDB={}", guid, age, pdb_path);
+
+            return Some(EmbeddedPdbInfo {
+                pdb_path,
+                signature: Some(PdbSignature {
+                    guid,
+                    age,
+                    raw,
+                }),
+            });
+        }
+
+        // NB10 格式（较旧的 PDB 2.0 格式）
+        if &signature == b"NB10" {
+            // NB10 格式结构：
+            // 4 bytes: "NB10" 签名
+            // 4 bytes: Offset（未使用）
+            // 4 bytes: Signature（时间戳）
+            // 4 bytes: Age
+            // n bytes: PDB 路径（以 null 结尾的 ASCII 字符串）
+
+            let mut nb10_data = vec![0u8; size as usize];
+            if file.read_exact(&mut nb10_data).is_err() {
+                return None;
+            }
+
+            // 提取 Signature（时间戳）
+            let signature = u32::from_le_bytes([
+                nb10_data[4], nb10_data[5], nb10_data[6], nb10_data[7]
+            ]);
+
+            // 提取 Age
+            let age = u32::from_le_bytes([
+                nb10_data[8], nb10_data[9], nb10_data[10], nb10_data[11]
+            ]);
+
+            // 提取 PDB 路径
+            let pdb_path_start = 12;
+            let pdb_path_bytes = &nb10_data[pdb_path_start..];
+            let pdb_path = match pdb_path_bytes.iter().position(|&b| b == 0) {
+                Some(null_pos) => String::from_utf8_lossy(&pdb_path_bytes[..null_pos]).to_string(),
+                None => String::from_utf8_lossy(pdb_path_bytes).to_string(),
+            };
+
+            let raw = format!("{:08X}{}", signature, age);
+
+            trace!("NB10 format: Signature={:08X}, Age={}, PDB={}", signature, age, pdb_path);
+
+            return Some(EmbeddedPdbInfo {
+                pdb_path,
+                signature: Some(PdbSignature {
+                    guid: format!("{:08X}", signature),
+                    age,
+                    raw,
+                }),
+            });
+        }
+
+        trace!("Unknown CodeView signature: {:?}", String::from_utf8_lossy(&signature));
+        None
     }
 
     /// 在系统符号缓存中查找
@@ -600,5 +872,62 @@ mod tests {
         assert!(path.contains("C:\\Symbols"));
         assert!(path.contains("srv*"));
         assert!(path.contains("https://server.com/symbols"));
+    }
+
+    #[test]
+    fn test_extract_pdb_info() {
+        // 测试从 Debug 版本的 cpu_intensive.exe 中提取 PDB 信息
+        let test_exe = PathBuf::from("target/debug/examples/cpu_intensive.exe");
+        
+        if !test_exe.exists() {
+            println!("Test executable not found: {}", test_exe.display());
+            return;
+        }
+
+        let locator = PdbLocator::new();
+        let result = locator.extract_pdb_info(&test_exe);
+
+        assert!(result.is_ok(), "extract_pdb_info should succeed");
+        
+        let pdb_info = result.unwrap();
+        assert!(pdb_info.is_some(), "Should find PDB info in debug executable");
+        
+        let info = pdb_info.unwrap();
+        println!("Found PDB path: {}", info.pdb_path);
+        
+        // 验证 PDB 路径不为空
+        assert!(!info.pdb_path.is_empty(), "PDB path should not be empty");
+        
+        // 验证签名存在
+        assert!(info.signature.is_some(), "Should have PDB signature");
+        
+        let sig = info.signature.unwrap();
+        println!("PDB GUID: {}, Age: {}", sig.guid, sig.age);
+        
+        // 验证 GUID 不为空
+        assert!(!sig.guid.is_empty(), "GUID should not be empty");
+        
+        // 验证 age 为正数
+        assert!(sig.age > 0, "Age should be positive");
+    }
+
+    #[test]
+    fn test_rva_to_file_offset() {
+        // 测试 RVA 转换函数
+        let sections = vec![
+            SectionInfo {
+                virtual_address: 0x1000,
+                virtual_size: 0x1000,
+                pointer_to_raw_data: 0x400,
+                size_of_raw_data: 0x1000,
+            },
+        ];
+
+        // RVA 在节范围内
+        assert_eq!(rva_to_file_offset(0x1000, &sections), 0x400);
+        assert_eq!(rva_to_file_offset(0x1500, &sections), 0x900);
+        
+        // RVA 不在节范围内（返回原始 RVA）
+        assert_eq!(rva_to_file_offset(0x500, &sections), 0x500);
     }
 }

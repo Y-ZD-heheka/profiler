@@ -629,10 +629,14 @@ impl EventProcessor {
             let pid_data = record.UserData.add(16) as *const u32;
             let pid = *pid_data;
 
-            let module_name = self.extract_module_name(record);
+            // 提取完整路径（而不仅仅是文件名）
+            let module_path = self.extract_module_path(record);
+            let module_name = self.extract_module_name(&module_path);
 
-            let info = ModuleInfo::new(base_address, size, &module_name);
-
+            // 创建 ModuleInfo 并设置完整路径
+            let mut info = ModuleInfo::new(base_address, size, &module_name);
+            info.path = Some(module_path.clone());
+            
             // 更新上下文跟踪器
             {
                 let mut tracker = self.context_tracker.write().unwrap();
@@ -640,8 +644,8 @@ impl EventProcessor {
             }
 
             debug!(
-                "Image loaded: PID={}, Name={}, Base=0x{:016X}, Size={}",
-                pid, module_name, base_address, size
+                "Image loaded: PID={}, Name={}, Path={}, Base=0x{:016X}, Size={}",
+                pid, module_name, module_path, base_address, size
             );
 
             Some(ProcessedEvent::ImageLoad(pid, info))
@@ -691,16 +695,39 @@ impl EventProcessor {
         }
     }
 
-    /// 从事件记录中提取模块名称
-    unsafe fn extract_module_name(&self, record: &EVENT_RECORD) -> String {
+    /// 从事件记录中提取模块完整路径
+    unsafe fn extract_module_path(&self, record: &EVENT_RECORD) -> String {
+        // 模块路径通常在扩展数据或用户数据的末尾
+        // 尝试从用户数据中提取 UTF-16 字符串
         if record.UserDataLength > 24 {
             let name_ptr = record.UserData.add(24) as *const u16;
             let max_len = (record.UserDataLength as usize - 24) / 2;
-            let slice = std::slice::from_raw_parts(name_ptr, max_len.min(512));
-            safe_utf16_to_string(slice)
+            let slice = std::slice::from_raw_parts(name_ptr, max_len.min(1024));
+            let full_path = safe_utf16_to_string(slice);
+            
+            // 如果路径为空，尝试从文件名推断或使用默认值
+            if full_path.is_empty() {
+                return String::from("<unknown>");
+            }
+            
+            full_path
         } else {
             String::from("<unknown>")
         }
+    }
+
+    /// 从完整路径中提取模块名称（文件名）
+    fn extract_module_name(&self, path: &str) -> String {
+        if path == "<unknown>" {
+            return String::from("<unknown>");
+        }
+        
+        // 从完整路径中提取文件名
+        std::path::Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| path.to_string())
     }
 
     /// 转换时间戳
@@ -831,13 +858,21 @@ impl EventHandler for EventProcessor {
         pid: ProcessId,
         base_address: Address,
         module_name: &str,
+        size: u64,
+        module_path: Option<&str>,
     ) {
-        let info = ModuleInfo::new(base_address, 0, module_name);
+        let mut info = ModuleInfo::new(base_address, size, module_name);
+        info.path = module_path.map(|s| s.to_string());
 
         {
             let mut tracker = self.context_tracker.write().unwrap();
             tracker.add_module(pid, info.clone());
         }
+
+        debug!(
+            "EventHandler::on_image_load: PID={}, Name={}, Path={:?}, Base=0x{:016X}, Size={}",
+            pid, module_name, module_path, base_address, size
+        );
 
         let processed = ProcessedEvent::ImageLoad(pid, info);
         for callback in &self.callbacks {

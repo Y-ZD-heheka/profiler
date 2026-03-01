@@ -7,7 +7,7 @@ use crate::config::ProfilerConfig;
 use crate::error::{EtwError, Result};
 use crate::etw::{
     EventProcessor, EtwSession, KernelProviderFlags, ProcessedEvent,
-    SessionConfig, SessionMode,
+    SessionConfig, SessionMode, safe_utf16_to_string,
 };
 use crate::etw::provider::ProviderConfig;
 use crate::types::ProcessId;
@@ -16,6 +16,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::{debug, error, info, trace, warn};
+
+use windows::core::GUID;
+use windows::Win32::System::Diagnostics::Etw::*;
+use windows::Win32::Foundation::{ERROR_SUCCESS, CloseHandle};
 
 // ============================================================================
 // 控制器配置
@@ -121,6 +125,8 @@ pub struct EtwController {
     running: AtomicBool,
     /// 是否已关闭
     shutdown: AtomicBool,
+    /// 实时处理句柄
+    trace_handles: Arc<Mutex<Vec<CONTROLTRACE_HANDLE>>>,
 }
 
 impl EtwController {
@@ -149,6 +155,7 @@ impl EtwController {
             event_processor: Arc::new(RwLock::new(EventProcessor::new())),
             running: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            trace_handles: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -499,6 +506,121 @@ impl EtwController {
     /// 获取控制器配置
     pub fn config(&self) -> &ControllerConfig {
         &self.config
+    }
+
+    /// 启动实时事件处理
+    ///
+    /// 开始从 ETW 会话接收实时事件并调用注册的回调
+    ///
+    /// # 参数
+    ///
+    /// - `session_name`: 要处理的会话名称
+    pub fn start_realtime_processing(&self, session_name: &str) -> Result<()> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Err(EtwError::new("Controller is shutdown").into());
+        }
+
+        let full_session_name = format!("{}_{}", self.config.base_session_name, session_name);
+        info!("Starting real-time processing for session: {}", full_session_name);
+
+        // 准备事件处理器引用
+        let event_processor = Arc::clone(&self.event_processor);
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = Arc::clone(&running);
+        
+        // 创建 ETW 会话名称（UTF-16）
+        let name_wide: Vec<u16> = full_session_name.encode_utf16().chain(Some(0)).collect();
+        
+        // 创建 TRACEHANDLE
+        let mut logfile: EVENT_TRACE_LOGFILEW = unsafe { std::mem::zeroed() };
+        logfile.LoggerName = windows::core::PWSTR(name_wide.as_ptr() as *mut _);
+        
+        // 设置处理模式为实时事件记录模式
+        let mode = PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_REAL_TIME;
+        unsafe {
+            std::ptr::addr_of_mut!(logfile.Anonymous1).cast::<u32>().write(mode);
+        }
+        
+        // 设置回调函数 - 使用正确的签名
+        unsafe extern "system" fn event_callback(
+            event_record: *mut EVENT_RECORD,
+        ) {
+            // 获取处理器上下文
+            let context = (*event_record).UserContext;
+            if context.is_null() {
+                return;
+            }
+            
+            let processor = &*(context as *const RwLock<EventProcessor>);
+            if let Ok(processor) = processor.read() {
+                processor.process_event(event_record);
+            }
+        }
+        
+        unsafe {
+            std::ptr::addr_of_mut!(logfile.Anonymous2).cast::<Option<unsafe extern "system" fn(*mut EVENT_RECORD)>>()
+                .write(Some(event_callback));
+        }
+        
+        // 将 event_processor 的指针作为上下文
+        let processor_ptr: *const RwLock<EventProcessor> = &*event_processor;
+        logfile.Context = processor_ptr as *mut _;
+
+        // 打开跟踪
+        let trace_handle = unsafe { OpenTraceW(&mut logfile) };
+        
+        if trace_handle.Value == u64::MAX {
+            return Err(EtwError::new(format!(
+                "Failed to open trace for session: {}", full_session_name
+            )).into());
+        }
+
+        // 保存句柄
+        {
+            let mut handles = self.trace_handles.lock().unwrap();
+            handles.push(CONTROLTRACE_HANDLE { Value: trace_handle.Value });
+        }
+
+        // 在后台线程中处理事件
+        let trace_handles = Arc::clone(&self.trace_handles);
+        std::thread::spawn(move || {
+            info!("ETW event processing thread started");
+            
+            // 处理事件
+            let result = unsafe { ProcessTrace(&[trace_handle], None, None) };
+            
+            if result != ERROR_SUCCESS {
+                warn!("ProcessTrace ended with result: {:?}", result);
+            }
+            
+            running_clone.store(false, Ordering::SeqCst);
+            
+            // 关闭跟踪句柄
+            unsafe { CloseTrace(trace_handle) };
+            
+            info!("ETW event processing thread ended");
+        });
+
+        self.running.store(true, Ordering::SeqCst);
+        info!("Real-time processing started for session: {}", full_session_name);
+        
+        Ok(())
+    }
+
+    /// 停止实时事件处理
+    pub fn stop_realtime_processing(&self) -> Result<()> {
+        info!("Stopping real-time processing");
+        
+        self.running.store(false, Ordering::SeqCst);
+        
+        let mut handles = self.trace_handles.lock().unwrap();
+        for handle in handles.drain(..) {
+            let trace_handle = PROCESSTRACE_HANDLE { Value: handle.Value };
+            unsafe { CloseTrace(trace_handle) };
+        }
+        
+        info!("Real-time processing stopped");
+        Ok(())
     }
 }
 

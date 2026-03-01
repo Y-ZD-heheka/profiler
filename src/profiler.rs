@@ -18,7 +18,7 @@ use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{debug, error, info, trace, warn};
 
 /// 性能分析器进度信息
@@ -131,13 +131,20 @@ impl Profiler {
         self.session.mark_running(None);
         self.running.store(true, Ordering::SeqCst);
 
+        // 创建通道用于接收 ETW 采样事件
+        let (sample_tx, mut sample_rx): (Sender<SampledProfileEvent>, Receiver<SampledProfileEvent>) = mpsc::channel(10000);
+
         // 创建ETW控制器并设置事件回调
-        self.setup_etw_controller()?;
+        self.setup_etw_controller(sample_tx)?;
 
         // 创建实时会话
         let session = self.etw_controller.as_ref().unwrap()
             .create_realtime_session(&self.config.session_name)?;
         self.etw_session = Some(session);
+
+        // 启动实时事件处理
+        self.etw_controller.as_ref().unwrap()
+            .start_realtime_processing(&self.config.session_name)?;
 
         // 设置关闭通道
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
@@ -188,31 +195,37 @@ impl Profiler {
                     }
                 }
 
-                // 生成模拟采样事件（用于测试数据流）
-                // 在实际实现中，这里应该从 ETW 事件流读取
-                if target_pid != 0 && stack_mgr.is_initialized() {
-                    // 尝试收集目标进程的样本
-                    let sample = SampledProfileEvent::new(
-                        start_time.elapsed().as_micros() as u64,
-                        target_pid,
-                        0, // 线程ID会在实际收集中获取
-                        0x00400000 + sample_counter, // 模拟指令指针
-                    );
+                // 从 ETW 通道接收真实采样事件
+                // 使用 try_recv 以非阻塞方式接收，如果没有事件则继续循环
+                let mut processed_samples = 0;
+                while let Ok(sample) = sample_rx.try_recv() {
+                    // 检查目标进程过滤
+                    if target_pid != 0 && sample.process_id != target_pid {
+                        continue;
+                    }
 
-                    match stack_mgr.on_sample(&sample) {
-                        Ok(Some(stack)) => {
-                            if let Ok(mut agg) = aggregator.lock() {
-                                if let Err(e) = agg.process_stack(&stack) {
-                                    trace!("Failed to process stack: {}", e);
-                                } else {
-                                    sample_counter += 1;
+                    if stack_mgr.is_initialized() {
+                        match stack_mgr.on_sample(&sample) {
+                            Ok(Some(stack)) => {
+                                if let Ok(mut agg) = aggregator.lock() {
+                                    if let Err(e) = agg.process_stack(&stack) {
+                                        trace!("Failed to process stack: {}", e);
+                                    } else {
+                                        sample_counter += 1;
+                                        processed_samples += 1;
+                                    }
                                 }
                             }
+                            Ok(None) => {}
+                            Err(e) => {
+                                trace!("Stack collection error: {}", e);
+                            }
                         }
-                        Ok(None) => {}
-                        Err(e) => {
-                            trace!("Stack collection error: {}", e);
-                        }
+                    }
+
+                    // 限制每次循环处理的最大样本数，避免阻塞
+                    if processed_samples >= 100 {
+                        break;
                     }
                 }
 
@@ -239,6 +252,21 @@ impl Profiler {
                 }
 
                 tokio::time::sleep(sample_interval).await;
+            }
+
+            // 处理剩余的样本
+            while let Ok(sample) = sample_rx.try_recv() {
+                if target_pid != 0 && sample.process_id != target_pid {
+                    continue;
+                }
+
+                if stack_mgr.is_initialized() {
+                    if let Ok(Some(stack)) = stack_mgr.on_sample(&sample) {
+                        if let Ok(mut agg) = aggregator.lock() {
+                            let _ = agg.process_stack(&stack);
+                        }
+                    }
+                }
             }
 
             let _ = stack_mgr.shutdown();
@@ -277,13 +305,12 @@ impl Profiler {
     }
 
     /// 设置ETW控制器和事件回调
-    fn setup_etw_controller(&mut self) -> Result<()> {
+    fn setup_etw_controller(&mut self, sample_tx: Sender<SampledProfileEvent>) -> Result<()> {
         // 创建ETW控制器
         let etw_controller = EtwController::new(&self.config)?;
         
-        // 获取堆栈管理器和聚合器的引用，用于事件处理
-        let stack_manager = Arc::new(Mutex::new(None::<StackManager>));
-        let aggregator = Arc::clone(&self.aggregator);
+        // 获取符号管理器和目标进程的引用，用于事件处理
+        let symbol_manager = Arc::clone(&self.symbol_manager);
         let target_process = self.config.target_process.clone();
         
         etw_controller.add_event_callback(move |event| {
@@ -301,29 +328,11 @@ impl Profiler {
                     trace!("Processing sample event: pid={}, tid={}, ip=0x{:x}",
                         sample.process_id, sample.thread_id, sample.instruction_pointer);
                     
-                    // 将采样事件传递给堆栈管理器处理
-                    if let Ok(manager_guard) = stack_manager.lock() {
-                        if let Some(ref manager) = *manager_guard {
-                            match manager.on_sample(sample) {
-                                Ok(Some(stack)) => {
-                                    // 堆栈收集成功，传递给聚合器
-                                    if let Ok(mut agg) = aggregator.lock() {
-                                        if let Err(e) = agg.process_stack(&stack) {
-                                            warn!("Failed to process stack: {}", e);
-                                        } else {
-                                            trace!("Stack processed successfully, {} frames", stack.total_depth());
-                                        }
-                                    }
-                                }
-                                Ok(None) => {
-                                    // 堆栈被过滤器排除
-                                    trace!("Stack filtered out");
-                                }
-                                Err(e) => {
-                                    // 堆栈收集失败
-                                    trace!("Failed to collect stack: {}", e);
-                                }
-                            }
+                    // 将采样事件发送到通道，供采集循环处理
+                    // 使用 try_send 以非阻塞方式发送
+                    if let Err(e) = sample_tx.try_send(*sample) {
+                        if matches!(e, mpsc::error::TrySendError::Full(_)) {
+                            trace!("Sample channel full, dropping sample");
                         }
                     }
                 }
@@ -340,8 +349,38 @@ impl Profiler {
                     trace!("Thread ended: TID={}", tid);
                 }
                 ProcessedEvent::ImageLoad(pid, info) => {
-                    trace!("Image loaded: PID={}, Name={}, Base=0x{:016X}",
-                        pid, info.name, info.base_address);
+                    debug!("Image loaded: PID={}, Name={}, Path={:?}, Base=0x{:016X}, Size={}",
+                        pid, info.name, info.path, info.base_address, info.size);
+                    
+                    // 加载模块符号 - 这是修复符号解析的关键
+                    // 使用从 ETW 事件提取的完整路径信息
+                    let mut module_info = crate::types::ModuleInfo::new(
+                        info.base_address,
+                        info.size,
+                        &info.name
+                    );
+                    
+                    // 传递完整路径给符号管理器（如果可用）
+                    if let Some(ref path) = info.path {
+                        module_info.path = Some(path.clone());
+                        debug!("Using module path for symbol loading: {}", path);
+                    } else {
+                        warn!("Module path not available for {}, symbol resolution may fail", info.name);
+                    }
+                    
+                    if let Err(e) = symbol_manager.on_module_load(*pid, &module_info) {
+                        warn!("Failed to load symbols for module {}: {}", info.name, e);
+                    } else {
+                        debug!("Successfully loaded symbols for module: {} at 0x{:016X}", info.name, info.base_address);
+                    }
+                }
+                ProcessedEvent::ImageUnload(pid, base_address) => {
+                    trace!("Image unloaded: PID={}, Base=0x{:016X}", pid, base_address);
+                    
+                    // 卸载模块符号
+                    if let Err(e) = symbol_manager.on_module_unload(*pid, *base_address) {
+                        trace!("Failed to unload module symbols: {}", e);
+                    }
                 }
                 _ => {}
             }
@@ -479,6 +518,7 @@ impl Profiler {
 
         // 停止ETW控制器
         if let Some(ref controller) = self.etw_controller {
+            let _ = controller.stop_realtime_processing();
             controller.shutdown_all()?;
         }
 

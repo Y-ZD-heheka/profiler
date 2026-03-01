@@ -152,12 +152,16 @@ pub trait EventHandler: Send {
     /// - `pid`: 加载模块的进程 ID
     /// - `base_address`: 模块基地址
     /// - `module_name`: 模块名称
+    /// - `size`: 模块大小（可选）
+    /// - `module_path`: 模块完整路径（可选）
     fn on_image_load(
         &mut self,
         timestamp: Timestamp,
         pid: ProcessId,
         base_address: Address,
         module_name: &str,
+        size: u64,
+        module_path: Option<&str>,
     );
 
     /// 处理系统调用事件

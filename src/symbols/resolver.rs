@@ -221,7 +221,19 @@ impl DbgHelpResolver {
         self.ensure_initialized()?;
 
         let module_name = get_module_name(module_path);
-        info!("Loading symbols for module: {} at 0x{:016X}", module_name, base_address);
+        let full_path = module_path.to_string_lossy();
+        
+        info!("[SYMBOL_LOAD] Loading symbols for module: {} at 0x{:016X} (size: {})", 
+            module_name, base_address, module_size);
+        info!("[SYMBOL_LOAD] Module path: {}", full_path);
+        
+        // 检查文件是否存在
+        let path_exists = module_path.exists();
+        info!("[SYMBOL_LOAD] Path exists: {}", path_exists);
+        
+        if !path_exists {
+            warn!("[SYMBOL_LOAD] Module file does not exist: {}", full_path);
+        }
 
         // 转换路径为宽字符
         let wide_path: Vec<u16> = module_path
@@ -234,6 +246,7 @@ impl DbgHelpResolver {
         // - process 是有效的进程句柄
         // - wide_path 是以 null 结尾的有效宽字符串
         // - 其他参数根据 API 要求传递
+        info!("[SYMBOL_LOAD] Calling SymLoadModuleExW for {}", module_name);
         let result = unsafe {
             SymLoadModuleExW(
                 self.process,
@@ -251,16 +264,26 @@ impl DbgHelpResolver {
             // 检查是否是模块已加载的错误（可以忽略）
             let last_error = unsafe { windows::Win32::Foundation::GetLastError() };
             if last_error == ERROR_INVALID_PARAMETER {
-                debug!("Module already loaded: {}", module_name);
+                info!("[SYMBOL_LOAD] Module already loaded: {}", module_name);
             } else {
-                warn!("Failed to load symbols for {}: {:?}", module_name, last_error);
+                error!("[SYMBOL_LOAD] SymLoadModuleExW FAILED for {}: error={:?}", module_name, last_error);
+                error!("[SYMBOL_LOAD]   - Path: {}", full_path);
+                error!("[SYMBOL_LOAD]   - Base: 0x{:016X}, Size: {}", base_address, module_size);
                 return Err(SymbolError::with_module(
-                    format!("Failed to load module symbols: {:?}", last_error),
+                    format!("SymLoadModuleExW failed with error {:?}", last_error),
                     &module_name,
                 ).into());
             }
         } else {
-            debug!("Successfully loaded symbols for {}", module_name);
+            info!("[SYMBOL_LOAD] SymLoadModuleExW SUCCESS for {}: module_handle=0x{:016X}", module_name, result);
+            
+            // 尝试验证符号是否可用
+            info!("[SYMBOL_LOAD] Verifying symbols are available for {}", module_name);
+            match self.verify_symbols_available(base_address) {
+                Ok(true) => info!("[SYMBOL_LOAD] Symbols verified available for {}", module_name),
+                Ok(false) => warn!("[SYMBOL_LOAD] Symbols NOT available for {} - PDB may be missing or mismatched", module_name),
+                Err(e) => warn!("[SYMBOL_LOAD] Could not verify symbols for {}: {}", module_name, e),
+            }
         }
 
         // 记录模块信息
@@ -330,12 +353,33 @@ impl DbgHelpResolver {
                 SymbolError::new("Failed to lock symbol cache")
             })?;
             if let Some(cached) = cache.get(&address) {
-                trace!("Cache hit for address 0x{:016X}", address);
+                trace!("[SYMBOL_RESOLVE] Cache hit for address 0x{:016X}", address);
                 return Ok(cached.symbol.clone());
             }
         }
 
-        trace!("Resolving address: 0x{:016X}", address);
+        info!("[SYMBOL_RESOLVE] Resolving address: 0x{:016X} (process_id: {})", address, self.process_id);
+
+        // 诊断：先检查地址所在的模块
+        let module_info = self.find_module_for_address(address);
+        let loaded_modules = self.get_loaded_modules().unwrap_or_default();
+        
+        info!("[SYMBOL_RESOLVE] Address 0x{:016X} is in module: {:?}", address, module_info);
+        info!("[SYMBOL_RESOLVE] Total loaded modules: {}", loaded_modules.len());
+        
+        // 列出所有已加载的模块用于调试
+        if !loaded_modules.is_empty() {
+            debug!("[SYMBOL_RESOLVE] Currently loaded modules:");
+            for (i, module) in loaded_modules.iter().enumerate() {
+                let contains = if address >= module.base_address && address < module.base_address + module.size {
+                    "CONTAINS_ADDR"
+                } else {
+                    ""
+                };
+                debug!("  [{}] {} at 0x{:016X} (size: 0x{:X}) {}", 
+                    i, module.name, module.base_address, module.size, contains);
+            }
+        }
 
         // 分配 SYMBOL_INFOW 结构
         // 需要包含 Name 字段的额外空间
@@ -353,6 +397,7 @@ impl DbgHelpResolver {
         // SAFETY: 调用 SymFromAddrW 获取符号信息
         // - process 是有效的进程句柄
         // - symbol_info 指向有效的 SYMBOL_INFOW 结构
+        info!("[SYMBOL_RESOLVE] Calling SymFromAddrW for 0x{:016X}", address);
         let result = unsafe {
             SymFromAddrW(
                 self.process,
@@ -363,13 +408,28 @@ impl DbgHelpResolver {
         };
 
         if let Err(err) = result {
-            trace!("SymFromAddrW failed for 0x{:016X}: {}", address, err);
+            let win_err_code = err.code().0;
+            error!("[SYMBOL_RESOLVE] SymFromAddrW FAILED for 0x{:016X}: error={} (code={})", 
+                address, err, win_err_code);
+
+            if let Some(ref module_name) = module_info {
+                error!(
+                    "[SYMBOL_RESOLVE] Address 0x{:016X} is in module '{}' but DbgHelp could not resolve it.",
+                    address, module_name
+                );
+                error!("[SYMBOL_RESOLVE] This usually means PDB file is missing or mismatched.");
+            } else {
+                error!(
+                    "[SYMBOL_RESOLVE] Address 0x{:016X} not found in any loaded module.",
+                    address
+                );
+            }
 
             // 返回包含地址的基本信息
             let symbol = SymbolInfo {
                 address,
                 name: format!("0x{:016X}", address),
-                module: self.find_module_for_address(address),
+                module: module_info,
                 source_file: None,
                 line_number: None,
             };
@@ -477,6 +537,55 @@ impl DbgHelpResolver {
         cache.clear();
         debug!("Symbol cache cleared");
         Ok(())
+    }
+
+    /// 验证指定基地址的模块是否有可用符号
+    /// 
+    /// 通过尝试解析模块基地址来验证符号是否已加载
+    fn verify_symbols_available(&self, base_address: Address) -> Result<bool> {
+        // 分配 SYMBOL_INFOW 结构
+        let mut symbol_buffer = vec![0u8; std::mem::size_of::<SYMBOL_INFOW>() + MAX_PATH as usize * 2];
+        let symbol_info = symbol_buffer.as_mut_ptr() as *mut SYMBOL_INFOW;
+
+        // SAFETY: 初始化 SYMBOL_INFOW 结构
+        unsafe {
+            (*symbol_info).SizeOfStruct = std::mem::size_of::<SYMBOL_INFOW>() as u32;
+            (*symbol_info).MaxNameLen = MAX_PATH;
+        }
+
+        let mut displacement: u64 = 0;
+
+        // SAFETY: 调用 SymFromAddrW 测试符号是否可用
+        let result = unsafe {
+            SymFromAddrW(
+                self.process,
+                base_address,
+                Some(&mut displacement),
+                symbol_info,
+            )
+        };
+
+        match result {
+            Ok(_) => {
+                // SAFETY: 提取符号名称
+                let symbol_name = unsafe {
+                    let name_len = (*symbol_info).NameLen as usize;
+                    if name_len > 0 && name_len < MAX_PATH as usize {
+                        let name_ptr = (*symbol_info).Name.as_ptr();
+                        let name_slice = std::slice::from_raw_parts(name_ptr, name_len);
+                        String::from_utf16_lossy(name_slice)
+                    } else {
+                        String::new()
+                    }
+                };
+                trace!("Symbol verification successful at 0x{:016X}: {}", base_address, symbol_name);
+                Ok(true)
+            }
+            Err(_) => {
+                trace!("Symbol verification failed at 0x{:016X}: no symbols available", base_address);
+                Ok(false)
+            }
+        }
     }
 
     /// 获取进程 ID

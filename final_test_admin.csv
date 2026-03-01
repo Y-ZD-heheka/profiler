@@ -1,0 +1,23 @@
+# ETW Performance Profiler Report
+# Generated: 2026-03-01 21:57:26
+# Target Process: Unknown (PID: 0)
+# Total Samples: 0
+# Total Threads: 0
+#
+## Summary
+Metric,Value
+Analysis Duration (ms),5263
+Total Samples,0
+Total Threads,0
+Total Functions,0
+#
+## Function Statistics by Thread
+ThreadID,Rank,FunctionName,ModuleName,FilePath,LineNumber,TotalTime_ms,SelfTime_ms,TotalPercent,SelfPercent,SampleCount
+#
+## Thread Summary
+ThreadID,ThreadName,TotalSamples,TotalTime_ms,CPU_Usage_Percent,Top3Functions
+#
+## Hot Call Paths
+ThreadID,Rank,PathDepth,CallPath,ExecutionCount,EstimatedTime_ms
+#
+# End of Report
