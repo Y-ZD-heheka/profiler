@@ -1,0 +1,10 @@
+session_name = "EtwProfilerSession"
+output_path = "config_output.csv"
+sample_interval_ms = 1
+enable_stack_walk = true
+max_stack_depth = 32
+symbol_paths = []
+duration_secs = 3
+include_system_calls = false
+min_sample_time_us = 0
+target_path = "target/release/examples/cpu_intensive.exe"

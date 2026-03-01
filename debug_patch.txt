@@ -1,0 +1,50 @@
+// ===== 需要在 profiler.rs 中添加的日志验证 =====
+
+// 1. 在 run() 方法中验证 ETW 事件是否被接收
+info!("Starting collection loop, ETW session active: {}", etw_session.is_some());
+
+// 2. 在 EventProcessor::process_sampled_profile() 中
+info!("Received SampledProfile: PID={}, TID={}, IP=0x{:016X}", 
+      process_id, thread_id, instruction_pointer);
+
+// 3. 在 StackManager::on_sample() 中  
+info!("Processing sample: pid={}, tid={}, collected {} frames", 
+      sample.process_id, sample.thread_id, stack.total_depth());
+
+// 4. 在 StatsAggregator::process_stack() 中
+info!("Processing stack for thread {} with {} frames, total_samples now: {}",
+      stack.thread_id, stack.frames.len(), self.total_samples);
+
+// 5. 在 generate_result() 中验证数据传递
+info!("Generating result: total_samples={}, thread_count={}", 
+      aggregator.total_samples(), aggregator.thread_count());
+
+// ===== 修复方案概要 =====
+
+// 方案1: 在 profiler.rs 的 run() 中集成 ETW 事件处理
+// - 创建 EventProcessor 实例
+// - 注册回调：当收到 Sample 事件时，调用 stack_manager.on_sample()
+// - 将返回的 CollectedStack 传递给 aggregator.process_stack()
+
+// 方案2: 修复数据流连接
+// - 修改收集循环，从 ETW 会话获取实际事件
+// - 或者使用 StackManager 的回调机制连接 Aggregator
+
+// 参考代码结构（需要添加到 profiler.rs）：
+/*
+let aggregator_clone = Arc::clone(&aggregator);
+let stack_manager_ref = &self.stack_manager;
+
+// 设置 ETW 事件回调
+etw_session.set_event_callback(move |event| {
+    if let ProcessedEvent::Sample(sample) = event {
+        // 转换为堆栈
+        if let Ok(Some(stack)) = stack_manager.on_sample(&sample) {
+            // 传递给聚合器
+            if let Ok(mut agg) = aggregator_clone.lock() {
+                let _ = agg.process_stack(&stack);
+            }
+        }
+    }
+});
+*/

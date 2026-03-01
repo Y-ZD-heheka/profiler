@@ -6,7 +6,7 @@
 use crate::analysis::{AggregatorConfig, AnalysisResult, StatsAggregator};
 use crate::config::ProfilerConfig;
 use crate::error::{ProcessError, ProfilerError, Result};
-use crate::etw::{EtwController, EtwSession, KernelProviderFlags};
+use crate::etw::{EtwController, EtwSession, EventProcessor, KernelProviderFlags, ProcessedEvent, SampledProfileEvent};
 use crate::report::{CsvReportGenerator, ReportConfig, ReportGenerator};
 use crate::session::{ProfilerSession, SessionState};
 use crate::stackwalker::{CollectedStack, StackManager, StackManagerConfig};
@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// 性能分析器进度信息
 #[derive(Debug, Clone)]
@@ -131,9 +131,8 @@ impl Profiler {
         self.session.mark_running(None);
         self.running.store(true, Ordering::SeqCst);
 
-        // 创建ETW控制器
-        let etw_controller = EtwController::new(&self.config)?;
-        self.etw_controller = Some(etw_controller);
+        // 创建ETW控制器并设置事件回调
+        self.setup_etw_controller()?;
 
         // 创建实时会话
         let session = self.etw_controller.as_ref().unwrap()
@@ -143,6 +142,11 @@ impl Profiler {
         // 设置关闭通道
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         self.shutdown_tx = Some(shutdown_tx);
+
+        // 获取目标进程ID
+        let target_pid = self.config.target_process.as_ref()
+            .and_then(|t| t.as_pid())
+            .unwrap_or(0);
 
         // 启动采样收集任务
         let sample_interval = Duration::from_millis(self.config.sample_interval_ms as u64);
@@ -155,11 +159,25 @@ impl Profiler {
         let running = Arc::clone(&self.running);
         let session_clone = self.session.clone();
         let aggregator = Arc::clone(&self.aggregator);
+        let stack_manager = Arc::clone(&self.symbol_manager);
+        let config = self.config.clone();
 
         // 在单独任务中运行收集循环
         let collector_handle = tokio::spawn(async move {
             let start_time = Instant::now();
-            let mut sample_count: u64 = 0;
+            let mut last_sample_count: u64 = 0;
+            let mut sample_counter: u64 = 0;
+
+            // 初始化堆栈收集
+            let stack_mgr_config = StackManagerConfig::default()
+                .with_max_depth(config.max_stack_depth as usize)
+                .with_kernel_stack(config.enable_stack_walk)
+                .with_skip_system_modules(!config.include_system_calls);
+            
+            let stack_mgr = StackManager::new(stack_mgr_config);
+            if let Err(e) = stack_mgr.initialize(stack_manager) {
+                warn!("Failed to initialize stack manager: {}", e);
+            }
 
             while running.load(Ordering::SeqCst) {
                 // 检查持续时间
@@ -170,15 +188,48 @@ impl Profiler {
                     }
                 }
 
-                // 模拟采样（实际实现中这里会从ETW获取事件）
-                // TODO: 集成实际的ETW事件处理
-                
-                sample_count += 1;
-                session_clone.increment_samples(1);
+                // 生成模拟采样事件（用于测试数据流）
+                // 在实际实现中，这里应该从 ETW 事件流读取
+                if target_pid != 0 && stack_mgr.is_initialized() {
+                    // 尝试收集目标进程的样本
+                    let sample = SampledProfileEvent::new(
+                        start_time.elapsed().as_micros() as u64,
+                        target_pid,
+                        0, // 线程ID会在实际收集中获取
+                        0x00400000 + sample_counter, // 模拟指令指针
+                    );
 
-                // 更新状态
-                if sample_count % 100 == 0 {
-                    session_clone.set_thread_count((sample_count / 100) as usize);
+                    match stack_mgr.on_sample(&sample) {
+                        Ok(Some(stack)) => {
+                            if let Ok(mut agg) = aggregator.lock() {
+                                if let Err(e) = agg.process_stack(&stack) {
+                                    trace!("Failed to process stack: {}", e);
+                                } else {
+                                    sample_counter += 1;
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            trace!("Stack collection error: {}", e);
+                        }
+                    }
+                }
+
+                // 从聚合器获取当前统计
+                if let Ok(agg) = aggregator.lock() {
+                    let current_samples = agg.total_samples();
+                    if current_samples > last_sample_count {
+                        session_clone.increment_samples(current_samples - last_sample_count);
+                        last_sample_count = current_samples;
+                    }
+                    session_clone.set_thread_count(agg.thread_count());
+                    
+                    // 更新状态
+                    if current_samples > 0 && current_samples % 100 == 0 {
+                        debug!("Collected {} samples, {} threads",
+                            current_samples, agg.thread_count());
+                    }
                 }
 
                 // 检查关闭信号
@@ -190,12 +241,16 @@ impl Profiler {
                 tokio::time::sleep(sample_interval).await;
             }
 
-            sample_count
+            let _ = stack_mgr.shutdown();
+            last_sample_count
         });
 
         // 等待收集完成或超时
+        let timeout_duration = duration.map(|d| d + Duration::from_secs(5))
+            .unwrap_or_else(|| Duration::from_secs(300));
+        
         let result = tokio::time::timeout(
-            Duration::from_secs(self.config.duration_secs.max(300)),
+            timeout_duration,
             collector_handle
         ).await;
 
@@ -211,13 +266,129 @@ impl Profiler {
             }
         }
 
-        self.stop()?;
+        // 停止分析器
+        self.stop_profiler()?;
 
         // 生成分析结果
         let analysis_result = self.generate_result()?;
         self.session.set_result(analysis_result.clone());
 
         Ok(analysis_result)
+    }
+
+    /// 设置ETW控制器和事件回调
+    fn setup_etw_controller(&mut self) -> Result<()> {
+        // 创建ETW控制器
+        let etw_controller = EtwController::new(&self.config)?;
+        
+        // 获取堆栈管理器和聚合器的引用，用于事件处理
+        let stack_manager = Arc::new(Mutex::new(None::<StackManager>));
+        let aggregator = Arc::clone(&self.aggregator);
+        let target_process = self.config.target_process.clone();
+        
+        etw_controller.add_event_callback(move |event| {
+            match event {
+                ProcessedEvent::Sample(sample) => {
+                    // 检查目标进程过滤
+                    if let Some(ref target) = target_process {
+                        if let Some(pid) = target.as_pid() {
+                            if sample.process_id != pid {
+                                return;
+                            }
+                        }
+                    }
+                    
+                    trace!("Processing sample event: pid={}, tid={}, ip=0x{:x}",
+                        sample.process_id, sample.thread_id, sample.instruction_pointer);
+                    
+                    // 将采样事件传递给堆栈管理器处理
+                    if let Ok(manager_guard) = stack_manager.lock() {
+                        if let Some(ref manager) = *manager_guard {
+                            match manager.on_sample(sample) {
+                                Ok(Some(stack)) => {
+                                    // 堆栈收集成功，传递给聚合器
+                                    if let Ok(mut agg) = aggregator.lock() {
+                                        if let Err(e) = agg.process_stack(&stack) {
+                                            warn!("Failed to process stack: {}", e);
+                                        } else {
+                                            trace!("Stack processed successfully, {} frames", stack.total_depth());
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    // 堆栈被过滤器排除
+                                    trace!("Stack filtered out");
+                                }
+                                Err(e) => {
+                                    // 堆栈收集失败
+                                    trace!("Failed to collect stack: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+                ProcessedEvent::ProcessStart(context) => {
+                    debug!("Process started: PID={}, Name={}", context.pid, context.name);
+                }
+                ProcessedEvent::ProcessEnd(pid, _, exit_code) => {
+                    debug!("Process ended: PID={}, ExitCode={}", pid, exit_code);
+                }
+                ProcessedEvent::ThreadStart(context) => {
+                    trace!("Thread started: TID={}, PID={}", context.tid, context.pid);
+                }
+                ProcessedEvent::ThreadEnd(tid, _) => {
+                    trace!("Thread ended: TID={}", tid);
+                }
+                ProcessedEvent::ImageLoad(pid, info) => {
+                    trace!("Image loaded: PID={}, Name={}, Base=0x{:016X}",
+                        pid, info.name, info.base_address);
+                }
+                _ => {}
+            }
+        });
+        
+        info!("ETW event callback registered");
+        self.etw_controller = Some(etw_controller);
+        
+        Ok(())
+    }
+
+    /// 停止分析器（内部方法，避免借用冲突）
+    fn stop_profiler(&mut self) -> Result<()> {
+        info!("Stopping profiler");
+        
+        if !self.running.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        self.session.mark_stopping();
+        self.running.store(false, Ordering::SeqCst);
+
+        // 发送关闭信号
+        if let Some(ref tx) = self.shutdown_tx {
+            let _ = tx.try_send(());
+        }
+
+        // 停止ETW会话
+        if let Some(ref mut session) = self.etw_session {
+            let _ = session.stop();
+        }
+
+        // 停止ETW控制器
+        if let Some(ref controller) = self.etw_controller {
+            let _ = controller.shutdown_all();
+        }
+
+        // 关闭堆栈管理器
+        let _ = self.stack_manager.shutdown();
+
+        // 关闭符号管理器
+        self.symbol_manager.shutdown()?;
+
+        self.session.mark_completed();
+        info!("Profiler stopped");
+
+        Ok(())
     }
 
     /// 附加到已运行的进程
@@ -369,6 +540,7 @@ impl Profiler {
         Ok(())
     }
 
+
     /// 生成分析结果
     fn generate_result(&self) -> Result<AnalysisResult> {
         let process_stats = ProcessStats::new(
@@ -385,10 +557,17 @@ impl Profiler {
             for (thread_id, thread_stats) in aggregator.get_all_thread_stats() {
                 result.add_thread_stats(thread_stats.clone());
             }
+            
+            info!(
+                "Generated result: {} samples, {} threads, {} functions",
+                result.total_samples,
+                result.thread_stats.len(),
+                result.thread_stats.values().map(|t| t.function_stats.len()).sum::<usize>()
+            );
         }
 
         result.analysis_start_time = self.session.start_time().elapsed().as_micros() as u64;
-        result.analysis_end_time = result.analysis_start_time + 
+        result.analysis_end_time = result.analysis_start_time +
             self.session.elapsed().as_micros() as u64;
 
         Ok(result)

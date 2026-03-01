@@ -10,7 +10,7 @@ use crate::report::formatter::ReportFormatter;
 use crate::report::summary::ReportSummary;
 use crate::types::{FunctionStats, ThreadId, ThreadStats};
 
-use csv::Writer;
+use csv::{Writer, WriterBuilder};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
@@ -84,11 +84,9 @@ impl CsvReportGenerator {
         writer: &mut Writer<W>,
         result: &AnalysisResult,
     ) -> Result<()> {
-        if self.config.include_bom {
-            let bom: &[u8] = b"\xEF\xBB\xBF";
-            writer.write_record(std::str::from_utf8(bom).map(|s| vec![s]).unwrap_or_default().as_slice())
-                .map_err(|e| ProfilerError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        }
+        // Note: BOM is skipped for CSV to avoid format issues
+        // CSV files with BOM can cause parsing problems in some tools
+        let _ = self.config.include_bom; // Acknowledge the config option
 
         let now = chrono::Local::now();
         let timestamp = now.format(&self.config.time_format).to_string();
@@ -107,7 +105,8 @@ impl CsvReportGenerator {
             .map_err(|e| ProfilerError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         writer.write_record(&[format!("# Total Threads: {}", result.thread_stats.len())])
             .map_err(|e| ProfilerError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        writer.write_record(&[] as &[&str])
+        // Empty line separator - use a comment instead of empty record to avoid CSV format issues
+        writer.write_record(&["#"])
             .map_err(|e| ProfilerError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         Ok(())
@@ -143,7 +142,8 @@ impl CsvReportGenerator {
                 .map_err(|e| ProfilerError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         }
 
-        writer.write_record(&[] as &[&str])
+        // Empty line separator - use a comment instead of empty record
+        writer.write_record(&["#"])
             .map_err(|e| ProfilerError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(())
     }
@@ -204,7 +204,8 @@ impl CsvReportGenerator {
             }
         }
 
-        writer.write_record(&[] as &[&str])
+        // Empty line separator - use a comment instead of empty record
+        writer.write_record(&["#"])
             .map_err(|e| ProfilerError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(())
     }
@@ -253,7 +254,8 @@ impl CsvReportGenerator {
             }
         }
 
-        writer.write_record(&[] as &[&str])
+        // Empty line separator - use a comment instead of empty record
+        writer.write_record(&["#"])
             .map_err(|e| ProfilerError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(())
     }
@@ -289,7 +291,8 @@ impl CsvReportGenerator {
                 .map_err(|e| ProfilerError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         }
 
-        writer.write_record(&[] as &[&str])
+        // Empty line separator - use a comment instead of empty record
+        writer.write_record(&["#"])
             .map_err(|e| ProfilerError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(())
     }
@@ -324,7 +327,8 @@ impl CsvReportGenerator {
             }
         }
 
-        writer.write_record(&[] as &[&str])
+        // Empty line separator - use a comment instead of empty record
+        writer.write_record(&["#"])
             .map_err(|e| ProfilerError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok(())
     }
@@ -365,7 +369,10 @@ impl ReportGenerator for CsvReportGenerator {
             ProfilerError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to create report file: {}", e)))
         })?;
 
-        let mut writer = Writer::from_writer(file);
+        // Use WriterBuilder with flexible mode to allow variable number of fields per record
+        let mut writer = WriterBuilder::new()
+            .flexible(true)
+            .from_writer(file);
         self.generate_all_sections(&mut writer, result)?;
 
         writer.flush().map_err(|e| {
@@ -379,7 +386,10 @@ impl ReportGenerator for CsvReportGenerator {
     fn generate_to_string(&self, result: &AnalysisResult) -> Result<String> {
         let mut buffer = Vec::new();
         {
-            let mut writer = Writer::from_writer(&mut buffer);
+            // Use WriterBuilder with flexible mode
+            let mut writer = WriterBuilder::new()
+                .flexible(true)
+                .from_writer(&mut buffer);
             self.generate_all_sections(&mut writer, result)?;
             writer.flush().map_err(|e| {
                 ProfilerError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to flush report buffer: {}", e)))

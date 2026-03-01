@@ -58,8 +58,8 @@ pub struct Cli {
     pub symbol_path: Vec<PathBuf>,
 
     /// 会话持续时间（秒），0 表示无限
-    #[arg(short, long, default_value = "10")]
-    pub duration: u64,
+    #[arg(short, long)]
+    pub duration: Option<u64>,
 
     /// 包含系统调用
     #[arg(long)]
@@ -152,10 +152,10 @@ impl Cli {
     }
 
     /// 获取持续时间（优先使用子命令中指定的）
-    pub fn get_duration(&self) -> u64 {
+    pub fn get_duration(&self) -> Option<u64> {
         match &self.command {
-            Some(Commands::Launch { duration, .. }) => duration.unwrap_or(self.duration),
-            Some(Commands::Attach { duration, .. }) => duration.unwrap_or(self.duration),
+            Some(Commands::Launch { duration, .. }) => duration.or(self.duration),
+            Some(Commands::Attach { duration, .. }) => duration.or(self.duration),
             _ => self.duration,
         }
     }

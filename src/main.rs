@@ -100,7 +100,7 @@ pub use session::{ProfilerSession, SessionState, SessionManager, SessionStats};
 use clap::Parser;
 use cli::{Cli, Commands, ProgressReporter};
 use console::style;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -258,8 +258,11 @@ async fn run_analyze_mode(_cli: &Cli, file: &Path) -> Result<()> {
 }
 
 /// 列出可分析的进程
-async fn run_list_processes(_user_only: bool) -> Result<()> {
+async fn run_list_processes(user_only: bool) -> Result<()> {
     println!("{}", style("Listing running processes...").cyan());
+    if user_only {
+        println!("{}", style("(Filtering: User processes only)").dim());
+    }
     
     // 使用更简单的实现方式 - 通过执行系统命令
     #[cfg(windows)]
@@ -276,6 +279,12 @@ async fn run_list_processes(_user_only: bool) -> Result<()> {
             let parts: Vec<&str> = line.split(',').collect();
             if parts.len() >= 2 {
                 let name = parts[0].trim_matches('"').to_string();
+                
+                // 如果启用用户进程过滤，跳过系统进程
+                if user_only && is_system_process(&name) {
+                    continue;
+                }
+                
                 if let Ok(pid) = parts[1].trim_matches('"').parse::<u32>() {
                     processes.push(cli::commands::ProcessInfo {
                         pid,
@@ -297,6 +306,26 @@ async fn run_list_processes(_user_only: bool) -> Result<()> {
     Ok(())
 }
 
+/// 检查是否为系统进程
+fn is_system_process(name: &str) -> bool {
+    let system_processes = [
+        "System Idle Process",
+        "System",
+        "Registry",
+        "smss.exe",
+        "csrss.exe",
+        "wininit.exe",
+        "services.exe",
+        "lsass.exe",
+        "svchost.exe",
+        "winlogon.exe",
+        "fontdrvhost.exe",
+        "kernel",
+    ];
+    
+    system_processes.iter().any(|&sys| name.eq_ignore_ascii_case(sys))
+}
+
 /// 运行分析器并显示UI
 async fn run_profiler_with_ui(
     cli: &Cli,
@@ -308,8 +337,8 @@ async fn run_profiler_with_ui(
         ProgressReporter::non_interactive()
     } else {
         let mut r = ProgressReporter::new();
-        if cli.get_duration() > 0 {
-            r.init_with_duration(Duration::from_secs(cli.get_duration()));
+        if let Some(duration_secs) = cli.get_duration() {
+            r.init_with_duration(Duration::from_secs(duration_secs));
         } else {
             r.init_spinner("Profiling...");
         }
@@ -329,8 +358,8 @@ async fn run_profiler_with_ui(
     }).map_err(|e| ProfilerError::Generic(format!("Failed to set Ctrl+C handler: {}", e)))?;
 
     // 启动分析任务
-    let duration = if cli.get_duration() > 0 {
-        Duration::from_secs(cli.get_duration())
+    let duration = if let Some(duration_secs) = cli.get_duration() {
+        Duration::from_secs(duration_secs)
     } else {
         Duration::from_secs(10) // 默认10秒
     };
@@ -390,12 +419,30 @@ fn create_config_from_cli(cli: &Cli) -> Result<ProfilerConfig> {
         ProfilerConfig::default()
     };
 
-    // 应用CLI参数覆盖
-    config.output_path = cli.get_output_path();
-    config.sample_interval_ms = cli.get_interval();
+    // 应用CLI参数覆盖（仅当用户显式指定时）
+    // 检查 output 是否被显式指定（不是默认值）
+    let has_custom_output = cli.output != PathBuf::from("profile_output.csv") ||
+        matches!(&cli.command,
+            Some(Commands::Launch { output: Some(_), .. }) |
+            Some(Commands::Attach { output: Some(_), .. })
+        );
+    
+    if has_custom_output {
+        config.output_path = cli.get_output_path();
+    }
+    
+    // 采样间隔：CLI 默认值是 1，如果不同则覆盖
+    if cli.interval != 1 {
+        config.sample_interval_ms = cli.get_interval();
+    }
+    
     config.enable_stack_walk = !cli.no_stack_walk;
     config.max_stack_depth = cli.max_depth;
-    config.duration_secs = cli.get_duration();
+    
+    // 只在用户显式指定 --duration 时才覆盖配置文件中的值
+    if let Some(duration_secs) = cli.get_duration() {
+        config.duration_secs = duration_secs;
+    }
     config.include_system_calls = cli.include_system;
 
     // 添加符号路径
